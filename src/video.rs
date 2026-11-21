@@ -172,7 +172,11 @@ pub fn describe_video(ask: &Ask, va: bool) -> String {
     describe_parts(ask, va).0
 }
 
-/// The card's sound, added half a second after the first frame (and only then), or None.
+/// The card's sound: its own pipeline (never part of the picture's), started half a second after the first frame:
+/// the speakers, and an appsink that hands recordings the sound. None when there's no sound.
+/// The sound's format between the sound's pipeline and a recording.
+pub const SOUND_CAPS: &str = "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2";
+
 pub fn describe_sound(ask: &Ask, have_pw: bool) -> Option<String> {
     let fake = ask.card.fake_picture.as_ref();
     let mut d = String::new();
@@ -185,7 +189,7 @@ pub fn describe_sound(ask: &Ask, have_pw: bool) -> Option<String> {
             } else {
                 format!("pulsesrc name=asrc device=\"{}\"", s.replace('"', ""))
             };
-            d.push_str(&format!("{asrc} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! tee name=at allow-not-linked=true"));
+            d.push_str(&format!("{asrc} ! audioconvert ! audioresample ! {SOUND_CAPS} ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! tee name=at allow-not-linked=true at. ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! appsink name=recsink sync=false max-buffers=100 drop=true"));
             if ask.play_sound {
                 let sink = if fake.is_some() { "fakesink name=asink sync=true" } else if have_pw { "pipewiresink name=asink sync=false stream-properties=\"props,node.latency=(string)1024/48000\"" } else { "autoaudiosink name=asink sync=false" };
                 d.push_str(&format!(" at. ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! volume name=vol volume={:.2} mute={} ! {sink}", ask.volume.min(100) as f64 / 100.0, ask.muted));
@@ -217,7 +221,7 @@ pub fn describe_rec(file: &Path, va_decoded: bool, venc: &str, aenc: Option<&str
             "voaacenc" => "voaacenc bitrate=192000 ! aacparse",
             _ => "opusenc bitrate=192000 ! opusparse",
         };
-        d.push_str(&format!(" queue name=raq max-size-buffers=0 max-size-bytes=0 max-size-time=3000000000 ! audioconvert ! audioresample ! {ae} ! queue ! mux."));
+        d.push_str(&format!(" appsrc name=raudio is-live=true format=time do-timestamp=true caps=\"{SOUND_CAPS}\" ! queue name=raq max-size-buffers=0 max-size-bytes=0 max-size-time=3000000000 ! audioconvert ! audioresample ! {ae} ! queue ! mux."));
     }
     d
 }
@@ -242,6 +246,7 @@ mod imp {
     }
     pub fn stop() {}
     pub fn set_volume(_v: u32, _muted: bool) {}
+    pub fn restart_sound(_ask: Ask) {}
     pub fn running() -> bool {
         false
     }
@@ -328,6 +333,69 @@ mod imp {
     }
 
     static RUN: Mutex<Option<Running>> = Mutex::new(None);
+    /// The card's sound, its own pipeline (Nov 21: the Elgato 4K S's picture stayed black, and the picture couldn't
+    /// stop, with the sound in the same pipeline).
+    static SOUND: Mutex<Option<gst::Pipeline>> = Mutex::new(None);
+    /// The recording's sound input, while one runs: the sound's pipeline hands it each piece.
+    static REC_AUDIO: Mutex<Option<gstreamer_app::AppSrc>> = Mutex::new(None);
+
+    fn stop_sound() {
+        let p = SOUND.lock().unwrap().take();
+        if let Some(p) = p {
+            let _ = std::thread::Builder::new().name("cc-sound-stop".into()).spawn(move || {
+                teardown(p, "the sound");
+            });
+        }
+    }
+
+    fn start_sound(sd: &str) {
+        stop_sound();
+        let p = match gst::parse::launch(sd).map(|e| e.downcast::<gst::Pipeline>()) {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => return crate::log("the card's sound couldn't be set up; the picture goes on without it"),
+            Err(e) => return crate::log(&format!("the card's sound couldn't be set up ({e}); the picture goes on without it")),
+        };
+        if let Some(sink) = p.by_name("recsink").and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok()) {
+            sink.set_callbacks(
+                gstreamer_app::AppSinkCallbacks::builder()
+                    .new_sample(|s| {
+                        let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        if let Some(src) = REC_AUDIO.lock().unwrap().as_ref() {
+                            if let Some(b) = sample.buffer_owned() {
+                                let mut b = b;
+                                {
+                                    let bm = b.make_mut();
+                                    bm.set_pts(gst::ClockTime::NONE);
+                                    bm.set_dts(gst::ClockTime::NONE);
+                                }
+                                let _ = src.push_buffer(b);
+                            }
+                        }
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            );
+        }
+        if p.set_state(gst::State::Playing).is_err() {
+            crate::log("the card's sound didn't start; the picture goes on without it");
+            let _ = std::thread::Builder::new().name("cc-sound-stop".into()).spawn(move || {
+                teardown(p, "the sound didn't start");
+            });
+            return;
+        }
+        crate::log("sound on (its own pipeline)");
+        *SOUND.lock().unwrap() = Some(p);
+    }
+
+    /// The sound alone again (a sound setting changed): the picture and the card aren't touched.
+    pub fn restart_sound(ask: Ask) {
+        match describe_sound(&ask, have("pipewiresrc")) {
+            Some(sd) if RUN.lock().unwrap().is_some() => {
+                let _ = std::thread::Builder::new().name("cc-sound".into()).spawn(move || start_sound(&sd));
+            }
+            _ => stop_sound(),
+        }
+    }
 
     fn init() -> bool {
         static OK: OnceLock<bool> = OnceLock::new();
@@ -388,6 +456,7 @@ mod imp {
     pub fn stop() {
         GEN.fetch_add(1, Ordering::Relaxed);
         STARTING.store(false, Ordering::Relaxed);
+        stop_sound();
         // A frame the window was told of but never took must not hold up the next pipeline's.
         let r = take_running();
         if let Some(r) = r {
@@ -439,8 +508,9 @@ mod imp {
     }
 
     pub fn set_volume(v: u32, muted: bool) {
-        if let Some(r) = RUN.lock().unwrap().as_ref() {
-            if let Some(vol) = r.pipeline.by_name("vol") {
+        let p = SOUND.lock().unwrap().clone();
+        if let Some(p) = p {
+            if let Some(vol) = p.by_name("vol") {
                 vol.set_property("volume", v.min(100) as f64 / 100.0);
                 vol.set_property("mute", muted);
             }
@@ -451,6 +521,7 @@ mod imp {
         // The old picture is taken down by this start itself, before it opens the card (a separate stop could still
         // hold the card when the new one opened it: "Another app is using the capture card", Nov 21).
         let old = take_running();
+        stop_sound();
         let gen = GEN.fetch_add(1, Ordering::Relaxed) + 1;
         // Set up off the window's thread (opening the card and the first moments take a little while).
         STARTING.store(true, Ordering::Relaxed);
@@ -725,7 +796,7 @@ mod imp {
         // The card's sound: half a second after its first frame, never with the picture's start (some cards, like
         // the Elgato 4K S, send no picture when both open at once). Only while this pipeline is the one in use.
         if let Some(sd) = sound {
-            let (p3, first3) = (pipeline.clone(), first.clone());
+            let first3 = first.clone();
             let _ = std::thread::Builder::new().name("cc-sound".into()).stack_size(128 * 1024).spawn(move || {
                 while !first3.load(Ordering::Relaxed) {
                     if gen != current() {
@@ -737,16 +808,7 @@ mod imp {
                 if gen != current() || RUN.lock().unwrap().as_ref().map(|r| r.gen != gen).unwrap_or(true) {
                     return;
                 }
-                match gst::parse::bin_from_description(&sd, false) {
-                    Ok(bin) => {
-                        if p3.add(&bin).is_ok() && bin.sync_state_with_parent().is_ok() {
-                            crate::log("sound added");
-                        } else {
-                            crate::log("the card's sound couldn't be added; the picture goes on without it");
-                        }
-                    }
-                    Err(e) => crate::log(&format!("the card's sound couldn't be set up ({e}); the picture goes on without it")),
-                }
+                start_sound(&sd);
             });
         }
         Ok(Running { gen, pipeline, va, rec: None, first, settled })
@@ -800,8 +862,8 @@ mod imp {
             send(gen, Event::Recording(Err("This PC can't record video: it has no H.264 encoder for GStreamer (gstreamer1-plugin-openh264 or the graphics card's VA-API).".into())));
             return;
         };
-        let at = r.pipeline.by_name("at");
-        let desc = describe_rec(&file, r.va, &venc, at.as_ref().and(aenc.as_deref()));
+        let have_sound = SOUND.lock().unwrap().is_some();
+        let desc = describe_rec(&file, r.va, &venc, if have_sound { aenc.as_deref() } else { None });
         crate::log(&format!("recording: {desc}"));
         if let Some(d) = file.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -820,7 +882,7 @@ mod imp {
         if !ok {
             why.push("add".into());
         }
-        for (tee_name, q) in [("vt", "rvq"), ("at", "raq")] {
+        for (tee_name, q) in [("vt", "rvq")] {
             let (Some(tee), Some(qe)) = (r.pipeline.by_name(tee_name), bin.by_name(q)) else { continue };
             let Some(sinkpad) = qe.static_pad("sink") else { continue };
             let ghost = match gst::GhostPad::builder_with_target(&sinkpad) {
@@ -870,6 +932,7 @@ mod imp {
             send(gen, Event::Recording(Err("Recording couldn't start.".into())));
             return;
         }
+        *REC_AUDIO.lock().unwrap() = bin.by_name("raudio").and_then(|e| e.downcast::<gstreamer_app::AppSrc>().ok());
         crate::log(&format!("recording into {}", file.display()));
         r.rec = Some(Rec { bin, pads, file: file.clone(), since: Instant::now() });
         send(gen, Event::Recording(Ok(file)));
@@ -888,6 +951,10 @@ mod imp {
     /// Unhooks the recording from the tees, ends its stream (so mp4mux writes the file's end), waits for it to reach
     /// the file (at most 5 s), then takes it out of the pipeline.
     fn finish_rec(p: &gst::Pipeline, rec: Rec, gen: u64, blocking: bool) {
+        // The sound's input ends first, so the file gets the end of both.
+        if let Some(src) = REC_AUDIO.lock().unwrap().take() {
+            let _ = src.end_of_stream();
+        }
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         if let Some(fs) = rec.bin.by_name("rfile").and_then(|f| f.static_pad("sink")) {
             let tx = tx.clone();
@@ -972,7 +1039,7 @@ mod imp {
     }
 }
 
-pub use imp::{encoders, probe, record_start, record_stop, recording, running, set_volume, start, stop};
+pub use imp::{encoders, probe, record_start, record_stop, recording, running, restart_sound, set_volume, start, stop};
 
 #[cfg(test)]
 mod tests {
@@ -1029,6 +1096,12 @@ mod tests {
         let r = describe_rec(Path::new("/v/Capture 1.mp4"), true, "vah264enc", Some("fdkaacenc"));
         assert!(r.contains("vapostproc ! video/x-raw,format=NV12") && r.contains("vah264enc bitrate=30000") && r.contains("mp4mux name=mux") && r.contains("fdkaacenc"));
         assert!(describe_rec(Path::new("/v/a.mp4"), false, "openh264enc", None).contains("openh264enc") );
+        // The picture's pipeline never has the sound in it; the sound is its own (Nov 21, the Elgato 4K S).
+        let v = describe_video(&ask(), true);
+        assert!(!v.contains("asrc") && !v.contains("pipewiresink"));
+        let snd = describe_sound(&ask(), true).unwrap();
+        assert!(snd.starts_with("pipewiresrc name=asrc") && snd.contains("appsink name=recsink") && snd.contains("volume name=vol"));
+        assert!(r.contains("appsrc name=raudio"), "a recording takes the sound from the sound's pipeline");
     }
 
     #[test]

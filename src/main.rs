@@ -884,6 +884,13 @@ fn handle(a: &mut App, m: Msg) -> Task<Msg> {
             if key == "card" {
                 return on_cards(a, a.cards.clone(), a.sources.clone());
             }
+            // The sound's own choices restart only the sound: the picture and the card stay as they are.
+            if matches!(key, "sound" | "playSound") && before != a.prefs && video::running() && a.rec.is_none() {
+                if let Some(ask) = ask_for(a, false) {
+                    video::restart_sound(ask);
+                }
+                return Task::none();
+            }
             if restart && before != a.prefs && video::running() && a.rec.is_none() {
                 return begin(a, a.sig == Sig::NoSignal);
             }
