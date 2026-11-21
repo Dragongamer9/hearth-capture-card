@@ -134,6 +134,15 @@ pub static VA_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// The pipeline's description (also checked by `cargo test`). `va`: decode with the graphics card.
 pub fn describe(ask: &Ask, va: bool, have_pw: bool) -> String {
+    let mut d = describe_video(ask, va);
+    if let Some(a) = describe_sound(ask, have_pw) {
+        d.push(' ');
+        d.push_str(&a);
+    }
+    d
+}
+
+fn describe_parts(ask: &Ask, va: bool) -> (String,) {
     let fake = ask.card.fake_picture.as_ref();
     let (fmt, w, h, fps) = if ask.watching { ask.card.lightest().unwrap_or(("MJPG".into(), ask.w, ask.h, 5)) } else { (ask.format.clone(), ask.w, ask.h, ask.fps) };
     let mjpg = fmt == "MJPG" || fake.is_some();
@@ -154,7 +163,19 @@ pub fn describe(ask: &Ask, va: bool, have_pw: bool) -> String {
     } else {
         format!("vt. ! queue name=vq max-size-buffers=4 max-size-bytes=0 max-size-time=0 ! {to_rgba} ! appsink name=pic sync=true max-buffers=2 drop=false")
     };
-    let mut d = format!("{src} ! {dec} ! tee name=vt allow-not-linked=true {view}");
+    (format!("{src} ! {dec} ! tee name=vt allow-not-linked=true {view}"),)
+}
+
+/// The picture's part alone: what's started first (the owner's Elgato 4K S, Nov 21: opening its sound at the same
+/// moment as its picture left the picture black; OBS opens the picture alone and it works).
+pub fn describe_video(ask: &Ask, va: bool) -> String {
+    describe_parts(ask, va).0
+}
+
+/// The card's sound, added half a second after the first frame (and only then), or None.
+pub fn describe_sound(ask: &Ask, have_pw: bool) -> Option<String> {
+    let fake = ask.card.fake_picture.as_ref();
+    let mut d = String::new();
     if !ask.watching {
         if let Some(s) = &ask.sound {
             let asrc = if fake.is_some() {
@@ -164,14 +185,14 @@ pub fn describe(ask: &Ask, va: bool, have_pw: bool) -> String {
             } else {
                 format!("pulsesrc name=asrc device=\"{}\"", s.replace('"', ""))
             };
-            d.push_str(&format!(" {asrc} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! queue max-size-time=60000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! tee name=at allow-not-linked=true"));
+            d.push_str(&format!("{asrc} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! queue max-size-time=60000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! tee name=at allow-not-linked=true"));
             if ask.play_sound {
                 let sink = if fake.is_some() { "fakesink name=asink sync=true" } else if have_pw { "pipewiresink name=asink sync=false stream-properties=\"props,node.latency=(string)256/48000\"" } else { "autoaudiosink name=asink sync=false" };
                 d.push_str(&format!(" at. ! queue max-size-time=60000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! volume name=vol volume={:.2} mute={} ! {sink}", ask.volume.min(100) as f64 / 100.0, ask.muted));
             }
         }
     }
-    d
+    if d.is_empty() { None } else { Some(d) }
 }
 
 /// The recording's own part of the pipeline (added while it runs): H.264 and the sound into MP4.
@@ -504,7 +525,8 @@ mod imp {
     }
 
     fn build(ask: &Ask, va: bool, gen: u64) -> Result<Running, String> {
-        let desc = describe(ask, va, have("pipewiresrc"));
+        let desc = describe_video(ask, va);
+        let sound = describe_sound(ask, have("pipewiresrc"));
         crate::log(&format!("pipeline: {desc}"));
         let el = gst::parse::launch(&desc).map_err(|e| format!("The player couldn't be set up: {e}"))?;
         let pipeline = el.downcast::<gst::Pipeline>().map_err(|_| "The player couldn't be set up.".to_string())?;
@@ -684,6 +706,33 @@ mod imp {
                 _ => {}
             }
         });
+        // The card's sound: half a second after its first frame, never with the picture's start (some cards, like
+        // the Elgato 4K S, send no picture when both open at once). Only while this pipeline is the one in use.
+        if let Some(sd) = sound {
+            let (p3, first3) = (pipeline.clone(), first.clone());
+            let _ = std::thread::Builder::new().name("cc-sound".into()).stack_size(128 * 1024).spawn(move || {
+                while !first3.load(Ordering::Relaxed) {
+                    if gen != current() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                if gen != current() || RUN.lock().unwrap().as_ref().map(|r| r.gen != gen).unwrap_or(true) {
+                    return;
+                }
+                match gst::parse::bin_from_description(&sd, false) {
+                    Ok(bin) => {
+                        if p3.add(&bin).is_ok() && bin.sync_state_with_parent().is_ok() {
+                            crate::log("sound added");
+                        } else {
+                            crate::log("the card's sound couldn't be added; the picture goes on without it");
+                        }
+                    }
+                    Err(e) => crate::log(&format!("the card's sound couldn't be set up ({e}); the picture goes on without it")),
+                }
+            });
+        }
         Ok(Running { gen, pipeline, va, rec: None, first, settled })
     }
 
