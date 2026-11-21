@@ -104,10 +104,25 @@ pub fn list() -> Vec<Card> {
     names.sort_by_key(|n| n[5..].parse::<u32>().unwrap_or(999));
     for n in names {
         if let Some(c) = read_one(&n) {
+            // A laptop's own camera or a webcam isn't a capture card (the owner's laptop, Nov 21: "Integrated Camera"
+            // was listed first); a known capture chip always counts.
+            if is_webcam(&c) {
+                continue;
+            }
             out.push(c);
         }
     }
     out
+}
+
+/// A camera, not a capture card: its name says so and it's no known capture chip.
+pub fn is_webcam(c: &Card) -> bool {
+    let n = format!("{} {}", c.name, c.chip).to_lowercase();
+    let capture = ["capture", "elgato", "hdmi", "cam link", "avermedia", "live gamer", "ms2130", "ms2109", "ms2131", "ms2106", "magewell", "razer ripsaw", "genki", "monster"];
+    if capture.iter().any(|k| n.contains(k)) {
+        return false;
+    }
+    ["camera", "webcam", "integrated c", "facetime", "hd uvc", "uvc camera"].iter().any(|k| n.contains(k))
 }
 
 pub fn read_fake(f: &Path) -> Option<Card> {
@@ -349,6 +364,21 @@ mod tests {
         assert_eq!(c.formats(), vec!["MJPG".to_string(), "YUYV".to_string()]);
         assert!(c.usb3());
         assert_eq!(Card { speed: 480, ..c }.usb_words(), "USB 2.0");
+    }
+
+    #[test]
+    fn webcams_are_not_capture_cards() {
+        let mut c = card();
+        c.name = "Integrated Camera".into();
+        c.chip = "".into();
+        assert!(is_webcam(&c));
+        c.name = "Elgato 4K S".into();
+        assert!(!is_webcam(&c));
+        c.name = "Cam Link 4K".into();
+        assert!(!is_webcam(&c));
+        c.name = "USB Video".into();
+        c.chip = "MS2130".into();
+        assert!(!is_webcam(&c));
     }
 
     #[test]

@@ -250,6 +250,53 @@ mod imp {
         pipeline: gst::Pipeline,
         va: bool,
         rec: Option<Rec>,
+        /// A frame came in (the start tries the next way when none does within a few seconds).
+        first: Arc<AtomicBool>,
+        /// The start stopped trying other ways: from now on no frames for 2 s is "no signal".
+        settled: Arc<AtomicBool>,
+    }
+
+    /// Takes a pipeline down, waiting at most 3 s: a card or decoder that hangs never holds up the window or the next
+    /// try (the owner's Elgato 4K S, Nov 21: "just freezing now"). True when it let go in time.
+    fn teardown(p: gst::Pipeline, why: &str) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t0 = Instant::now();
+        let _ = std::thread::Builder::new().name("cc-null".into()).spawn(move || {
+            let _ = p.set_state(gst::State::Null);
+            let _ = tx.send(());
+        });
+        let ok = rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        crate::log(&format!("stopped ({why}): {}", if ok { format!("in {} ms", t0.elapsed().as_millis()) } else { "the card didn't let go within 3 s; going on without waiting".into() }));
+        ok
+    }
+
+    /// The ways to try, best first: what you chose (with the graphics card's decoder where it can), the same with the
+    /// CPU's, your size at the card's own best rate (an HDMI signal at 60 gives nothing at 30 on some cards), then
+    /// YUYV 1080p60. Waiting for a signal: only the lightest mode.
+    fn ladder(ask: &Ask) -> Vec<(Ask, bool)> {
+        let va = use_va(ask);
+        if ask.watching || ask.card.fake_picture.is_some() {
+            return vec![(ask.clone(), va)];
+        }
+        let mut out: Vec<(Ask, bool)> = Vec::new();
+        let mut add = |a: Ask, v: bool, out: &mut Vec<(Ask, bool)>| {
+            if !out.iter().any(|(b, w)| b.format == a.format && b.w == a.w && b.h == a.h && b.fps == a.fps && *w == v) {
+                out.push((a, v));
+            }
+        };
+        if va {
+            add(ask.clone(), true, &mut out);
+        }
+        add(ask.clone(), false, &mut out);
+        let rates = ask.card.rates(&ask.format, ask.w, ask.h);
+        let best = if rates.contains(&60) { Some(60) } else { rates.iter().copied().filter(|r| *r <= 60).max() };
+        if let Some(r) = best.filter(|r| *r != ask.fps) {
+            add(Ask { fps: r, ..ask.clone() }, false, &mut out);
+        }
+        if let Some((f, w, h, r)) = ask.card.pick("YUYV", 1920, 1080, 60).filter(|m| m.0 == "YUYV") {
+            add(Ask { format: f, w, h, fps: r, ..ask.clone() }, false, &mut out);
+        }
+        out
     }
 
     struct Rec {
@@ -318,8 +365,43 @@ mod imp {
                     // Stopping with a recording open: its file is closed properly first.
                     finish_rec(&r.pipeline, rec, r.gen, true);
                 }
-                let _ = r.pipeline.set_state(gst::State::Null);
+                teardown(r.pipeline, "stop");
             });
+        }
+    }
+
+    #[cfg(test)]
+    mod ladder_tests {
+        use super::*;
+        use crate::card::{Card, Mode};
+
+        fn elgato() -> Card {
+            Card {
+                dev: "/dev/video2".into(),
+                id: "0fd9:00af:x".into(),
+                name: "Elgato 4K S".into(),
+                chip: String::new(),
+                speed: 5000,
+                usb_port: "1-1".into(),
+                modes: vec![
+                    Mode { format: "YUYV".into(), w: 1920, h: 1080, fps: vec![60, 50, 30, 25] },
+                    Mode { format: "MJPG".into(), w: 1920, h: 1080, fps: vec![240, 144, 120, 60, 50, 30, 25] },
+                ],
+                fake_picture: None,
+                fake_sound: None,
+            }
+        }
+
+        #[test]
+        fn an_elgato_at_30_tries_the_cpu_then_60_then_yuyv() {
+            assert!(init());
+            std::env::set_var("HEARTH_CAPTURE_DECODER", "cpu");
+            let ask = Ask { card: elgato(), format: "MJPG".into(), w: 1920, h: 1080, fps: 30, low_delay: true, sound: None, play_sound: false, volume: 70, muted: false, watching: false };
+            let l = ladder(&ask);
+            let ways: Vec<String> = l.iter().map(|(a, v)| format!("{} {}x{}@{} {}", a.format, a.w, a.h, a.fps, if *v { "va" } else { "cpu" })).collect();
+            assert_eq!(ways, vec!["MJPG 1920x1080@30 cpu", "MJPG 1920x1080@60 cpu", "YUYV 1920x1080@60 cpu"]);
+            let w = ladder(&Ask { watching: true, ..ask });
+            assert_eq!(w.len(), 1, "waiting for a signal: only the lightest mode");
         }
     }
 
@@ -345,27 +427,64 @@ mod imp {
                 send(gen, Event::Failed("GStreamer couldn't start on this PC.".into()));
                 return;
             }
-            let va = use_va(&ask);
-            let r = match build(&ask, va, gen) {
-                Ok(r) => Ok(r),
-                Err(e) if va => {
-                    // The graphics card's decoder isn't usable here: the CPU's, for as long as the app is open.
-                    VA_FAILED.store(true, Ordering::Relaxed);
-                    crate::log(&format!("the graphics card's decoder didn't start ({e}); decoding with the CPU"));
-                    build(&ask, false, gen)
+            let tries = ladder(&ask);
+            let n = tries.len();
+            let mut last_err = String::new();
+            for (i, (a, va)) in tries.into_iter().enumerate() {
+                if gen != current() {
+                    return;
                 }
-                Err(e) => Err(e),
-            };
-            match r {
-                Ok(r) => {
-                    let mut g = RUN.lock().unwrap();
-                    if gen == current() {
-                        *g = Some(r);
-                    } else {
-                        let _ = r.pipeline.set_state(gst::State::Null);
+                let last = i + 1 == n;
+                crate::log(&format!("try {}/{}: {} {}x{} at {} with the {}", i + 1, n, a.format, a.w, a.h, a.fps, if va { "graphics card's decoder" } else { "CPU's decoder" }));
+                let r = match build(&a, va, gen) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        crate::log(&format!("didn't start: {e}"));
+                        if va {
+                            VA_FAILED.store(true, Ordering::Relaxed);
+                        }
+                        last_err = e;
+                        continue;
                     }
+                };
+                let (first, settled) = (r.first.clone(), r.settled.clone());
+                {
+                    let mut g = RUN.lock().unwrap();
+                    if gen != current() {
+                        drop(g);
+                        teardown(r.pipeline, "a newer start");
+                        return;
+                    }
+                    *g = Some(r);
                 }
-                Err(e) => send(gen, Event::Failed(e)),
+                if last {
+                    settled.store(true, Ordering::Relaxed);
+                    return;
+                }
+                // A picture within 3 s: this way works. None: the next way (this one let go first).
+                let t0 = Instant::now();
+                while !first.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(3) && gen == current() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if first.load(Ordering::Relaxed) {
+                    crate::log(&format!("picture after {} ms", t0.elapsed().as_millis()));
+                    settled.store(true, Ordering::Relaxed);
+                    return;
+                }
+                if gen != current() {
+                    return;
+                }
+                crate::log("no picture within 3 s");
+                if va {
+                    VA_FAILED.store(true, Ordering::Relaxed);
+                }
+                let taken = RUN.lock().unwrap().take();
+                if let Some(r) = taken {
+                    teardown(r.pipeline, "trying the next way");
+                }
+            }
+            if !last_err.is_empty() && gen == current() {
+                send(gen, Event::Failed(last_err));
             }
         });
     }
@@ -378,6 +497,8 @@ mod imp {
         let sink = pipeline.by_name("pic").and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok()).ok_or("The player has no picture.")?;
         let (beat_tx, beat_rx) = std::sync::mpsc::channel::<()>();
         let watching = ask.watching;
+        let first = Arc::new(AtomicBool::new(false));
+        let settled = Arc::new(AtomicBool::new(false));
         // The frames: into FRAME for the window; blank / real picture for the signal.
         {
             let started = Arc::new(AtomicBool::new(false));
@@ -388,10 +509,12 @@ mod imp {
             let fmt = if watching { ask.card.lightest().map(|m| m.0).unwrap_or_default() } else { ask.format.clone() };
             let (w0, h0, f0) = if watching { ask.card.lightest().map(|m| (m.1, m.2, m.3)).unwrap_or((ask.w, ask.h, ask.fps)) } else { (ask.w, ask.h, ask.fps) };
             let decoder = if va { "graphics card".to_string() } else { "CPU".to_string() };
+            let first_cb = first.clone();
             sink.set_callbacks(
                 gstreamer_app::AppSinkCallbacks::builder()
                     .new_sample(move |s| {
                         let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        first_cb.store(true, Ordering::Relaxed);
                         let _ = beat_tx.send(());
                         let (w, h) = sample.caps().and_then(|c| c.structure(0).map(|st| (st.get::<i32>("width").unwrap_or(0), st.get::<i32>("height").unwrap_or(0)))).unwrap_or((0, 0));
                         let Some(buf) = sample.buffer() else { return Ok(gst::FlowSuccess::Ok) };
@@ -445,9 +568,22 @@ mod imp {
         }
         // No frames at all for 2 s: no signal. Then it sleeps until a frame comes (or the pipeline goes).
         if !watching {
+            let settled_b = settled.clone();
             let _ = std::thread::Builder::new().name("cc-beat".into()).stack_size(64 * 1024).spawn(move || {
                 let mut said = false;
                 loop {
+                    // While the start is still trying other ways, no frames isn't "no signal" yet.
+                    if !settled_b.load(Ordering::Relaxed) {
+                        match beat_rx.recv_timeout(Duration::from_millis(250)) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if gen != current() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            Err(_) => return,
+                        }
+                    }
                     let r = if said { beat_rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected) } else { beat_rx.recv_timeout(Duration::from_secs(2)) };
                     match r {
                         Ok(()) => said = false,
@@ -472,7 +608,7 @@ mod imp {
         if va {
             if let Some(m) = bus.timed_pop_filtered(gst::ClockTime::from_mseconds(1200), &[gst::MessageType::Error]) {
                 let e = words(&m);
-                let _ = pipeline.set_state(gst::State::Null);
+                teardown(pipeline, "the graphics card's decoder refused");
                 return Err(e);
             }
         }
@@ -534,7 +670,7 @@ mod imp {
                 _ => {}
             }
         });
-        Ok(Running { gen, pipeline, va, rec: None })
+        Ok(Running { gen, pipeline, va, rec: None, first, settled })
     }
 
     fn first_error(bus: &gst::Bus) -> Option<String> {
