@@ -181,14 +181,14 @@ pub fn describe_sound(ask: &Ask, have_pw: bool) -> Option<String> {
             let asrc = if fake.is_some() {
                 "audiotestsrc name=asrc is-live=true wave=sine volume=0.05".to_string()
             } else if have_pw {
-                format!("pipewiresrc name=asrc target-object=\"{}\" do-timestamp=true stream-properties=\"props,node.latency=(string)256/48000\"", s.replace('"', ""))
+                format!("pipewiresrc name=asrc target-object=\"{}\" do-timestamp=true stream-properties=\"props,node.latency=(string)1024/48000\"", s.replace('"', ""))
             } else {
                 format!("pulsesrc name=asrc device=\"{}\"", s.replace('"', ""))
             };
-            d.push_str(&format!("{asrc} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! queue max-size-time=60000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! tee name=at allow-not-linked=true"));
+            d.push_str(&format!("{asrc} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! tee name=at allow-not-linked=true"));
             if ask.play_sound {
-                let sink = if fake.is_some() { "fakesink name=asink sync=true" } else if have_pw { "pipewiresink name=asink sync=false stream-properties=\"props,node.latency=(string)256/48000\"" } else { "autoaudiosink name=asink sync=false" };
-                d.push_str(&format!(" at. ! queue max-size-time=60000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! volume name=vol volume={:.2} mute={} ! {sink}", ask.volume.min(100) as f64 / 100.0, ask.muted));
+                let sink = if fake.is_some() { "fakesink name=asink sync=true" } else if have_pw { "pipewiresink name=asink sync=false stream-properties=\"props,node.latency=(string)1024/48000\"" } else { "autoaudiosink name=asink sync=false" };
+                d.push_str(&format!(" at. ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! volume name=vol volume={:.2} mute={} ! {sink}", ask.volume.min(100) as f64 / 100.0, ask.muted));
             }
         }
     }
@@ -372,17 +372,25 @@ mod imp {
     /// Held while a pipeline is being taken down or set up, so a new one never meets the old one at the card.
     static TURN: Mutex<()> = Mutex::new(());
 
+    /// The running picture, taken out (the stop's own message posted to its bus), for whoever takes it down.
+    fn take_running() -> Option<Running> {
+        PENDING.store(false, Ordering::Release);
+        let r = RUN.lock().unwrap().take();
+        *FRAME.lock().unwrap() = None;
+        if let Some(r) = &r {
+            if let Some(b) = r.pipeline.bus() {
+                let _ = b.post(gst::message::Application::new(gst::Structure::new_empty("hearth-stop")));
+            }
+        }
+        r
+    }
+
     pub fn stop() {
         GEN.fetch_add(1, Ordering::Relaxed);
         STARTING.store(false, Ordering::Relaxed);
         // A frame the window was told of but never took must not hold up the next pipeline's.
-        PENDING.store(false, Ordering::Release);
-        let r = RUN.lock().unwrap().take();
-        *FRAME.lock().unwrap() = None;
+        let r = take_running();
         if let Some(r) = r {
-            if let Some(b) = r.pipeline.bus() {
-                let _ = b.post(gst::message::Application::new(gst::Structure::new_empty("hearth-stop")));
-            }
             // Taken down off the window's thread (closing the card can take a moment).
             let _ = std::thread::Builder::new().name("cc-stop".into()).spawn(move || {
                 let _turn = TURN.lock().unwrap();
@@ -440,12 +448,20 @@ mod imp {
     }
 
     pub fn start(ask: Ask) {
-        stop();
+        // The old picture is taken down by this start itself, before it opens the card (a separate stop could still
+        // hold the card when the new one opened it: "Another app is using the capture card", Nov 21).
+        let old = take_running();
         let gen = GEN.fetch_add(1, Ordering::Relaxed) + 1;
         // Set up off the window's thread (opening the card and the first moments take a little while).
         STARTING.store(true, Ordering::Relaxed);
         let _ = std::thread::Builder::new().name("cc-start".into()).spawn(move || {
             let _turn = TURN.lock().unwrap();
+            if let Some(r) = old {
+                if let Some(rec) = r.rec {
+                    finish_rec(&r.pipeline, rec, r.gen, true);
+                }
+                teardown(r.pipeline, "a new start");
+            }
             struct Done(u64);
             impl Drop for Done {
                 fn drop(&mut self) {
