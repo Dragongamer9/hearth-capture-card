@@ -187,11 +187,11 @@ pub fn describe_sound(ask: &Ask, have_pw: bool) -> Option<String> {
             } else if have_pw {
                 format!("pipewiresrc name=asrc target-object=\"{}\" do-timestamp=true stream-properties=\"props,node.latency=(string)1024/48000\"", s.replace('"', ""))
             } else {
-                format!("pulsesrc name=asrc device=\"{}\"", s.replace('"', ""))
+                format!("pulsesrc name=asrc device=\"{}\" do-timestamp=true buffer-time=100000 latency-time=20000", s.replace('"', ""))
             };
             d.push_str(&format!("{asrc} ! audioconvert ! audioresample ! {SOUND_CAPS} ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! tee name=at allow-not-linked=true at. ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! appsink name=recsink sync=false max-buffers=100 drop=true"));
             if ask.play_sound {
-                let sink = if fake.is_some() { "fakesink name=asink sync=true" } else if have_pw { "pipewiresink name=asink sync=false stream-properties=\"props,node.latency=(string)1024/48000\"" } else { "autoaudiosink name=asink sync=false" };
+                let sink = if fake.is_some() { "fakesink name=asink sync=true" } else if have_pw { "pipewiresink name=asink sync=false stream-properties=\"props,node.latency=(string)1024/48000\"" } else { "pulsesink name=asink sync=false buffer-time=100000 latency-time=20000" };
                 d.push_str(&format!(" at. ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! volume name=vol volume={:.2} mute={} ! {sink}", ask.volume.min(100) as f64 / 100.0, ask.muted));
             }
         }
@@ -389,7 +389,7 @@ mod imp {
 
     /// The sound alone again (a sound setting changed): the picture and the card aren't touched.
     pub fn restart_sound(ask: Ask) {
-        match describe_sound(&ask, have("pipewiresrc")) {
+        match describe_sound(&ask, use_pw()) {
             Some(sd) if RUN.lock().unwrap().is_some() => {
                 let _ = std::thread::Builder::new().name("cc-sound".into()).spawn(move || start_sound(&sd));
             }
@@ -404,6 +404,13 @@ mod imp {
 
     fn have(f: &str) -> bool {
         gst::ElementFactory::find(f).is_some()
+    }
+
+    /// The sound goes through PipeWire's Pulse side (pulsesrc / pulsesink, what OBS uses) whenever it's there:
+    /// with pipewiresrc and pipewiresink in one pipeline the Elgato 4K S was linked but nothing came through, and
+    /// the sound's stop hung (Nov 21). pipewiresrc only when there's no pulse plugin.
+    fn use_pw() -> bool {
+        !(have("pulsesrc") && have("pulsesink")) && have("pipewiresrc")
     }
 
     /// The encoders this PC has for recording: (video, sound).
@@ -613,7 +620,7 @@ mod imp {
 
     fn build(ask: &Ask, va: bool, gen: u64) -> Result<Running, String> {
         let desc = describe_video(ask, va);
-        let sound = describe_sound(ask, have("pipewiresrc"));
+        let sound = describe_sound(ask, use_pw());
         crate::log(&format!("pipeline: {desc}"));
         let el = gst::parse::launch(&desc).map_err(|e| format!("The player couldn't be set up: {e}"))?;
         let pipeline = el.downcast::<gst::Pipeline>().map_err(|_| "The player couldn't be set up.".to_string())?;
@@ -1102,6 +1109,9 @@ mod tests {
         let snd = describe_sound(&ask(), true).unwrap();
         assert!(snd.starts_with("pipewiresrc name=asrc") && snd.contains("appsink name=recsink") && snd.contains("volume name=vol"));
         assert!(r.contains("appsrc name=raudio"), "a recording takes the sound from the sound's pipeline");
+        // Through Pulse (what OBS uses) when it's there: in and out (Nov 21, no sound through pipewiresrc/sink).
+        let ps = describe_sound(&ask(), false).unwrap();
+        assert!(ps.starts_with("pulsesrc name=asrc device=") && ps.contains("pulsesink name=asink") && !ps.contains("pipewire"));
     }
 
     #[test]
