@@ -9,8 +9,7 @@ its sound, screenshots and recordings. Made for Hearth OS (Fedora edition) by Dr
   as a USB microphone), with the graphics card's decoder where there is one.
 - Works with the mouse and keyboard, a touchpad or a controller, on the desktop and in Game Mode.
 
-The approved mockups and their checklist live in Hearth OS (`docs/mockups/capture-card`,
-`docs/mockups/checklists/capture-card.md`).
+The approved mockups and their checklist are in `docs/mockups` (the checklist: `docs/mockups/checklists/capture-card.md`).
 
 ## Building
 
