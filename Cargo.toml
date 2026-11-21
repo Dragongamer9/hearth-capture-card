@@ -5,7 +5,7 @@
 # libraries are needed only here (the OS image's hearth-ui build is untouched). Built and tested only in GitHub Actions (.github/workflows/ci.yml). Version 1.0 is the owner's number (Nov 20, 2026), 1.1 too (Nov 21); never change it without asking him.
 [package]
 name = "hearth-capture-card"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Capture Card: your Xbox (or any HDMI) on this PC's screen through a USB capture card"
 license = "GPL-3.0-or-later"

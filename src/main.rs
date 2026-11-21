@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The app's version (the owner's numbers: 1.0 on Nov 20, 2026, 1.1 on Nov 21).
-pub const VERSION: &str = "1.1";
+pub const VERSION: &str = "1.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
