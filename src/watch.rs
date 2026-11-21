@@ -23,7 +23,11 @@ fn reader(tx: UnboundedSender<()>) {
     if fd < 0 {
         return;
     }
-    let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_ATTRIB | libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE;
+    // A card plugged in or out (its /dev/videoN made or removed). Not ATTRIB or CLOSE_WRITE on /dev: opening a card to
+    // read its modes, or the picture starting and stopping, closes it too, and that made the app read the cards and
+    // start the picture again and again (the owner's Elgato 4K S, Nov 21: about 25 restarts in a few seconds, and the
+    // card switched itself off). CI's stand-in file still counts when it's written.
+    let mask = if only.is_some() { libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE } else { libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_TO };
     if unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask) } < 0 {
         unsafe { libc::close(fd) };
         return;

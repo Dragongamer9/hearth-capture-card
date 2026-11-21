@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The app's version (the owner's number, Nov 20, 2026).
-pub const VERSION: &str = "1.0";
+/// The app's version (the owner's numbers: 1.0 on Nov 20, 2026, 1.1 on Nov 21).
+pub const VERSION: &str = "1.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -784,6 +784,7 @@ fn on_cards(a: &mut App, cards: Vec<Card>, sources: Vec<Source>) -> Task<Msg> {
         awake(a, false);
         return Task::none();
     }
+    // The same card at the same place: a picture that's on (or still starting) is left alone.
     let same = before.as_ref().map(|b| b.id == a.card.as_ref().unwrap().id && b.dev == a.card.as_ref().unwrap().dev).unwrap_or(false);
     if a.page == Page::Live && (!same || !video::running()) {
         return begin(a, false);

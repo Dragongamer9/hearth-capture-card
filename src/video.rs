@@ -342,14 +342,18 @@ mod imp {
     }
 
     pub fn running() -> bool {
-        RUN.lock().unwrap().is_some()
+        RUN.lock().unwrap().is_some() || STARTING.load(Ordering::Relaxed)
     }
+
+    /// A start is still trying its ways (between them nothing is running, and that's not "stopped").
+    static STARTING: AtomicBool = AtomicBool::new(false);
 
     /// Held while a pipeline is being taken down or set up, so a new one never meets the old one at the card.
     static TURN: Mutex<()> = Mutex::new(());
 
     pub fn stop() {
         GEN.fetch_add(1, Ordering::Relaxed);
+        STARTING.store(false, Ordering::Relaxed);
         // A frame the window was told of but never took must not hold up the next pipeline's.
         PENDING.store(false, Ordering::Release);
         let r = RUN.lock().unwrap().take();
@@ -418,8 +422,18 @@ mod imp {
         stop();
         let gen = GEN.fetch_add(1, Ordering::Relaxed) + 1;
         // Set up off the window's thread (opening the card and the first moments take a little while).
+        STARTING.store(true, Ordering::Relaxed);
         let _ = std::thread::Builder::new().name("cc-start".into()).spawn(move || {
             let _turn = TURN.lock().unwrap();
+            struct Done(u64);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    if self.0 == current() {
+                        STARTING.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+            let _done = Done(gen);
             if gen != current() {
                 return;
             }
