@@ -29,8 +29,8 @@ EOF
 
 # The Store's own files, as an installed app that's up to date (Settings › Hearth Store: Up to date).
 mkdir -p "$CIH/.local/share/hearth/store/apps/capture-card" "$CIH/.cache/hearth/hearth-store"
-echo '{"version": "1.0"}' > "$CIH/.local/share/hearth/store/apps/capture-card/store.json"
-echo '{"apps": {"capture-card": {"version": "1.0"}}}' > "$CIH/.cache/hearth/hearth-store/releases.json"
+echo '{"version": "1.1"}' > "$CIH/.local/share/hearth/store/apps/capture-card/store.json"
+echo '{"apps": {"capture-card": {"version": "1.1"}}}' > "$CIH/.cache/hearth/hearth-store/releases.json"
 chown -R ci "$CIH"
 
 # The fixtures: the stand-in card's pictures, 6 recordings (their thumbnails and lengths in the app's cache, as the
