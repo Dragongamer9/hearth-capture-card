@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The app's version (the owner's numbers: 1.0 on Nov 20, 2026, 1.1 on Nov 21).
-pub const VERSION: &str = "1.1";
+pub const VERSION: &str = "1.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -883,6 +883,13 @@ fn handle(a: &mut App, m: Msg) -> Task<Msg> {
             let restart = matches!(key, "card" | "format" | "size" | "fps" | "lowDelay" | "sound" | "playSound");
             if key == "card" {
                 return on_cards(a, a.cards.clone(), a.sources.clone());
+            }
+            // The sound's own choices restart only the sound: the picture and the card stay as they are.
+            if matches!(key, "sound" | "playSound") && before != a.prefs && video::running() && a.rec.is_none() {
+                if let Some(ask) = ask_for(a, false) {
+                    video::restart_sound(ask);
+                }
+                return Task::none();
             }
             if restart && before != a.prefs && video::running() && a.rec.is_none() {
                 return begin(a, a.sig == Sig::NoSignal);
