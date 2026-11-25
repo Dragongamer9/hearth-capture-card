@@ -187,12 +187,12 @@ pub fn describe_sound(ask: &Ask, have_pw: bool) -> Option<String> {
             } else if have_pw {
                 format!("pipewiresrc name=asrc target-object=\"{}\" do-timestamp=true stream-properties=\"props,node.latency=(string)1024/48000\"", s.replace('"', ""))
             } else {
-                format!("pulsesrc name=asrc device=\"{}\" do-timestamp=true buffer-time=100000 latency-time=20000", s.replace('"', ""))
+                format!("pulsesrc name=asrc device=\"{}\" do-timestamp=true buffer-time=200000 latency-time=20000", s.replace('"', ""))
             };
             d.push_str(&format!("{asrc} ! audioconvert ! audioresample ! {SOUND_CAPS} ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! tee name=at allow-not-linked=true at. ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! appsink name=recsink sync=false max-buffers=100 drop=true"));
             if ask.play_sound {
-                let sink = if fake.is_some() { "fakesink name=asink sync=true" } else if have_pw { "pipewiresink name=asink sync=false stream-properties=\"props,node.latency=(string)1024/48000\"" } else { "pulsesink name=asink sync=false buffer-time=100000 latency-time=20000" };
-                d.push_str(&format!(" at. ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! volume name=vol volume={:.2} mute={} ! {sink}", ask.volume.min(100) as f64 / 100.0, ask.muted));
+                let sink = if fake.is_some() { "fakesink name=asink sync=true" } else if have_pw { "pipewiresink name=asink sync=true stream-properties=\"props,node.latency=(string)1024/48000\"" } else { "pulsesink name=asink sync=true slave-method=skew drift-tolerance=40000 buffer-time=200000 latency-time=20000" };
+                d.push_str(&format!(" at. ! queue max-size-time=500000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! volume name=vol volume={:.2} mute={} ! {sink}", ask.volume.min(100) as f64 / 100.0, ask.muted));
             }
         }
     }
@@ -339,7 +339,17 @@ mod imp {
     /// The recording's sound input, while one runs: the sound's pipeline hands it each piece.
     static REC_AUDIO: Mutex<Option<gstreamer_app::AppSrc>> = Mutex::new(None);
 
+    /// Which sound pipeline is the current one (its watch stops when a newer one starts or the sound stops).
+    static SOUND_GEN: AtomicU64 = AtomicU64::new(0);
+    /// When the card's sound last handed over a piece (ms since SOUND_T0): the watch restarts a sound that stalls.
+    static SOUND_LAST: AtomicU64 = AtomicU64::new(0);
+    static SOUND_T0: OnceLock<Instant> = OnceLock::new();
+    fn sound_ms() -> u64 {
+        SOUND_T0.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
     fn stop_sound() {
+        SOUND_GEN.fetch_add(1, Ordering::SeqCst);
         let p = SOUND.lock().unwrap().take();
         if let Some(p) = p {
             let _ = std::thread::Builder::new().name("cc-sound-stop".into()).spawn(move || {
@@ -360,6 +370,7 @@ mod imp {
                 gstreamer_app::AppSinkCallbacks::builder()
                     .new_sample(|s| {
                         let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        SOUND_LAST.store(sound_ms(), Ordering::Relaxed);
                         if let Some(src) = REC_AUDIO.lock().unwrap().as_ref() {
                             if let Some(b) = sample.buffer_owned() {
                                 let mut b = b;
@@ -384,7 +395,41 @@ mod imp {
             return;
         }
         crate::log("sound on (its own pipeline)");
+        let gen = SOUND_GEN.load(Ordering::SeqCst);
+        SOUND_LAST.store(sound_ms(), Ordering::Relaxed);
+        let bus = p.bus();
         *SOUND.lock().unwrap() = Some(p);
+        // The watch (Nov 25: on the owner's Nvidia PC the sound went away after 10-15 minutes and didn't come back):
+        // an error or end on the sound's pipeline, or no sound handed over for 3 s, starts the sound again by itself
+        // (the picture isn't touched). It stops when a newer sound starts or the sound is stopped.
+        let sd = sd.to_string();
+        let _ = std::thread::Builder::new().name("cc-sound-watch".into()).spawn(move || {
+            let Some(bus) = bus else { return };
+            loop {
+                if SOUND_GEN.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                let why = match bus.timed_pop_filtered(gst::ClockTime::from_mseconds(500), &[gst::MessageType::Error, gst::MessageType::Eos]) {
+                    Some(m) => match m.view() {
+                        gst::MessageView::Error(e) => Some(format!("it stopped ({})", e.error())),
+                        _ => Some("it ended".to_string()),
+                    },
+                    None if sound_ms().saturating_sub(SOUND_LAST.load(Ordering::Relaxed)) > 3000 => Some("nothing came for 3 s".to_string()),
+                    None => None,
+                };
+                if let Some(why) = why {
+                    if SOUND_GEN.load(Ordering::SeqCst) != gen || RUN.lock().unwrap().is_none() {
+                        return;
+                    }
+                    crate::log(&format!("the card's sound: {why}; starting it again"));
+                    std::thread::sleep(Duration::from_millis(300));
+                    if SOUND_GEN.load(Ordering::SeqCst) == gen {
+                        start_sound(&sd);
+                    }
+                    return;
+                }
+            }
+        });
     }
 
     /// The sound alone again (a sound setting changed): the picture and the card aren't touched.
@@ -1112,6 +1157,8 @@ mod tests {
         // Through Pulse (what OBS uses) when it's there: in and out (Nov 21, no sound through pipewiresrc/sink).
         let ps = describe_sound(&ask(), false).unwrap();
         assert!(ps.starts_with("pulsesrc name=asrc device=") && ps.contains("pulsesink name=asink") && !ps.contains("pipewire"));
+        // Keeps time with the card's sound (Nov 25: gone after 10-15 minutes when the two clocks drifted apart).
+        assert!(ps.contains("pulsesink name=asink sync=true slave-method=skew"), "{ps}");
     }
 
     #[test]
